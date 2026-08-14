@@ -146,3 +146,39 @@ The full Russian inventory produced by this pipeline is covered, schwa included
 
 `remap_ruphon_ipa` must run **before** `normalize_text`, whose affricate pass
 does not recognise the tilde tie-bar form.
+
+## Credits
+
+This repository is thin. Almost all of the linguistic work is done by other
+people's open source, and the two Den4ikAI libraries in particular are what
+make context-sensitive Russian G2P possible at all here.
+
+### Runtime dependencies
+
+| project | author | license | role |
+| --- | --- | --- | --- |
+| [RUAccent](https://github.com/Den4ikAI/ruaccent) | Den4ikAI | MIT | **Stage 1.** Stress placement, homograph resolution and ё restoration. Models on the Hub at [`ruaccent/accentuator`](https://huggingface.co/ruaccent/accentuator); this pipeline uses `turbo3.1` with the dictionary enabled. |
+| [RUPhon](https://github.com/Den4ikAI/ruphon) | Denis Petrov, Ivan Shivalov (© 2024) | Apache-2.0 | **Stage 2.** `+`-accented Cyrillic → narrow IPA with stress-conditioned vowel reduction. This pipeline uses the `big` model. |
+| [ONNX Runtime](https://github.com/microsoft/onnxruntime) | Microsoft | MIT | Executes both models. RUAccent builds four sessions and RUPhon one; the threading note above is about this runtime, not about the libraries. |
+| [transformers](https://github.com/huggingface/transformers) / [huggingface_hub](https://github.com/huggingface/huggingface_hub) | Hugging Face | Apache-2.0 | Tokenizers and model download. The `transformers<5` pin these libraries carry is the reason this runs in its own environment. |
+
+### Phoneme inventory
+
+| project | author | license | role |
+| --- | --- | --- | --- |
+| [Piper](https://github.com/rhasspy/piper) | rhasspy (Michael Hansen) | MIT | `data/text_vocab.py` is built on Piper's phoneme set — ids 0–156 are the Piper core, 157–244 are extensions added for the other languages in the parent system. |
+
+### Referenced, not used
+
+| project | role here |
+| --- | --- |
+| [espeak-ng](https://github.com/espeak-ng/espeak-ng) (GPL-3.0) | The obvious alternative front end, and the one this pipeline deliberately does *not* use for Russian — see "Why not espeak-ng" above. |
+| [nsu-ai/russian_g2p](https://github.com/nsu-ai/russian_g2p) | NSU's Russian G2P, compared against above. Different output format and a different approach to stress; not a dependency. |
+
+### Data
+
+The measurements quoted in this README — the 60.3% ё figure, the 96% всё
+figure, the 26 замок tokens — come from a Russian read-audiobook corpus of
+LibriVox recordings ("Russian LibriSpeech"), ~50k utterances. The numbers are
+reported so the corrections in `russian_g2p.py` can be checked rather than
+taken on trust; the audio itself is not redistributed here.
