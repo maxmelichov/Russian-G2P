@@ -1,0 +1,194 @@
+"""
+Russian G2P: Cyrillic -> narrow IPA for TTS, in the 256-token Piper vocab.
+
+ARCHITECTURE: Two-Stage (accentuation -> phonemization -> vocab remap)
+  1. RUAccent  resolves lexical stress AND restores omitted ё, from sentence
+     context. Emits the '+'-before-stressed-vowel convention.
+  2. RUPhon    turns '+'-accented Cyrillic into narrow IPA, applying the
+     stress-conditioned vowel reduction that makes Russian sound Russian
+     (зам+ок -> zɐm'ok vs з+амок -> z'amək).
+  3. remap     folds RUPhon's tie-bar affricates and ASCII stress mark onto the
+     symbols this project's vocab already uses.
+
+Stage 1+2 need the ruaccent/ruphon packages, which pin transformers<5 and are
+therefore kept OUT of the training environment: ``scripts/phonemize_russian.py``
+runs them once offline and writes an ``ipa`` column, exactly as the
+yiddish24-wav corpus ships a precomputed one. Only ``remap_ruphon_ipa`` -- which
+is pure string work -- is imported by the training/inference path.
+
+WHY NOT ESPEAK: espeak-ng's ru voice cannot disambiguate homographs at all (it
+is context-invariant, so на двери висит замок and на горе стоит замок phonemize
+identically), cannot restore ё that the orthography omits (~34% of rows in
+russian_librispeech need it, and ё is always stressed), and writes ы as /y/ --
+which collides with the German ü already in this vocab.
+"""
+
+from __future__ import annotations
+
+import re
+
+# =====================================================================
+# STAGE 3: VOCAB REMAP
+#
+# RUPhon marks affricates with a tilde tie-bar (t~s) and stress with an ASCII
+# apostrophe. Both are technically in the 256-token table already, but as the
+# WRONG tokens: '~' is this vocab's tilde and "'" is its apostrophe, so stress
+# would silently train into a punctuation embedding without ever raising an OOV.
+# =====================================================================
+
+# Tie-bar affricates -> the single ligatures this vocab uses. ч is /tɕ/ and ʧ is
+# /tʃ/, so the mapping is lossy by design: it shares an embedding with the
+# Yiddish and English affricate rather than sitting alone.
+_AFFRICATES: dict[str, str] = {
+    "t~s": "ʦ",   # ʦ  ц       -- matches yiddish_g2p, which emits ʦ directly
+    "t~ɕ": "ʧ",   # ʧ  ч
+    "t~ʂ": "ʧ",   # ʧ  тш across a morpheme boundary (rare)
+    "d~z": "ʣ",   # ʣ  дз (loanwords)
+    "d~ʑ": "ʤ",   # ʤ  дж
+    "d~ʐ": "ʤ",   # ʤ  дж (retroflex realisation)
+}
+
+# RUPhon's stress mark (U+0027) -> the IPA primary stress every other language
+# in this vocab uses (U+02C8).
+_RUPHON_STRESS = "'"
+_IPA_STRESS = "ˈ"
+
+# Any tie-bar this table does not name: keep both segments, drop the bar.
+_RESIDUAL_TIE = re.compile(r"(\S)~(\S)")
+
+
+def remap_ruphon_ipa(text: str) -> str:
+    """Fold RUPhon output onto this project's phoneme inventory.
+
+    Pure string transformation with no model dependencies, so it is safe to
+    import from the training and inference paths. Must run BEFORE
+    ``text_vocab.normalize_text``, whose affricate pass does not recognise the
+    tilde tie-bar form.
+    """
+    for src, dst in _AFFRICATES.items():
+        text = text.replace(src, dst)
+    text = _RESIDUAL_TIE.sub(r"\1\2", text)
+    return text.replace(_RUPHON_STRESS, _IPA_STRESS)
+
+
+def mark_yo_stress(accented: str) -> str:
+    """Ensure every ё-bearing word carries an explicit stress mark.
+
+    RUAccent only inserts '+' where stress is ambiguous, so it leaves ё alone when
+    the orthography already writes it -- but RUPhon needs the mark to realise ё as
+    /ɵ/ and renders the bare letter as /e/. ё is *always* stressed in Russian, so
+    marking it is unconditionally correct.
+
+    Without this, 445 of the 738 rows in russian_librispeech that spell ё out
+    (60.3%) produced no /ɵ/ at all. ё-restoration was unaffected -- RUAccent marks
+    the stress on ё it inserts itself -- so this only touches already-written ё,
+    which includes very common words (всё, ещё, её).
+    """
+    out = []
+    for word in accented.split(" "):
+        if "ё" in word and "+" not in word:
+            word = word.replace("ё", "+ё", 1)
+        out.append(word)
+    return " ".join(out)
+
+
+# Words RUPhon mispronounces no matter how they are marked. всё renders /fsʲe/
+# whether written всё, вс+ё or Вс+ё, and no respelling helps (фсё -> fsʲe,
+# всьо -> fsʲjɵ). It cannot be patched at the IPA level either: /fsʲe/ is the
+# CORRECT reading of все ("all"), and все/всё is precisely the ё distinction --
+# so the substitution has to know which source word it came from.
+#
+# Scoped deliberately tight. In russian_librispeech, всё* is 453 of the 472
+# ё-tokens that phonemize wrong (96%); the rest occur 1-3 times each.
+_WORD_IPA_OVERRIDES: dict[str, str] = {
+    "всё": "fsʲˈɵ",
+}
+
+
+def apply_word_overrides(source: str, ipa: str) -> str:
+    """Replace IPA tokens for source words in ``_WORD_IPA_OVERRIDES``.
+
+    Token-aligned and fail-safe: if the word counts disagree, RUPhon did not emit
+    one token per input word and the alignment cannot be trusted, so the IPA is
+    returned untouched rather than corrupted.
+    """
+    src_tokens = source.split()
+    ipa_tokens = ipa.split()
+    if len(src_tokens) != len(ipa_tokens):
+        return ipa
+    changed = False
+    for i, raw in enumerate(src_tokens):
+        key = raw.strip(".,!?;:\"'()«»—").lower()
+        replacement = _WORD_IPA_OVERRIDES.get(key)
+        if replacement is None:
+            continue
+        # Carry over any trailing punctuation the phonemizer kept.
+        tail = ""
+        while ipa_tokens[i] and ipa_tokens[i][-1] in ".,!?;:":
+            tail = ipa_tokens[i][-1] + tail
+            ipa_tokens[i] = ipa_tokens[i][:-1]
+        ipa_tokens[i] = replacement + tail
+        changed = True
+    return " ".join(ipa_tokens) if changed else ipa
+
+
+def to_vocab_ipa(text: str) -> str:
+    """RUPhon output -> normalized IPA ready for ``text_to_indices``."""
+    from data.text_vocab import normalize_text
+
+    return normalize_text(remap_ruphon_ipa(text), apply_hebrew_fixes=False)
+
+
+# =====================================================================
+# STAGES 1-2: the model-backed front end (offline / inference only)
+# =====================================================================
+
+_ACCENTOR = None
+_PHONEMIZER = None
+
+
+def _load(device: str = "CPU", workdir: str | None = None):
+    """Lazily build the RUAccent + RUPhon pair. Requires ruaccent and ruphon."""
+    global _ACCENTOR, _PHONEMIZER
+    if _ACCENTOR is None or _PHONEMIZER is None:
+        try:
+            from ruaccent import RUAccent
+            from ruphon import RUPhon
+        except ImportError as exc:  # pragma: no cover
+            raise ImportError(
+                "Russian raw-text G2P needs ruaccent and ruphon:\n"
+                "  pip install ruaccent ruphon 'transformers<5'\n"
+                "These pin transformers<5, so prefer running "
+                "scripts/phonemize_russian.py in a separate venv and consuming "
+                "its precomputed 'ipa' column."
+            ) from exc
+
+        accentor = RUAccent()
+        accentor.load(
+            omograph_model_size="turbo3.1",
+            use_dictionary=True,
+            tiny_mode=False,
+        )
+        phonemizer = RUPhon()
+        kwargs = {"device": device}
+        if workdir:
+            kwargs["workdir"] = workdir
+        _ACCENTOR, _PHONEMIZER = accentor, phonemizer.load("big", **kwargs)
+    return _ACCENTOR, _PHONEMIZER
+
+
+def accent_russian(text: str, device: str = "CPU", workdir: str | None = None) -> str:
+    """Cyrillic -> '+'-accented Cyrillic with ё restored."""
+    accentor, _ = _load(device, workdir)
+    return mark_yo_stress(accentor.process_all(str(text).strip()))
+
+
+def phonemize_russian(
+    text: str, device: str = "CPU", workdir: str | None = None
+) -> str:
+    """Raw Cyrillic -> IPA on this project's phoneme inventory (unnormalized)."""
+    accentor, phonemizer = _load(device, workdir)
+    source = str(text).strip()
+    accented = mark_yo_stress(accentor.process_all(source))
+    ipa = remap_ruphon_ipa(phonemizer.phonemize(accented)).strip()
+    return apply_word_overrides(source, ipa)
