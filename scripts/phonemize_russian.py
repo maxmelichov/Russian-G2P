@@ -40,7 +40,9 @@ from data.russian_g2p import (  # noqa: E402  (pure string work)
     apply_word_overrides,
     mark_yo_stress,
     remap_ruphon_ipa,
+    to_vocab_ipa,
 )
+from data.text_vocab import unknown_symbols  # noqa: E402
 
 DEFAULT_ROOT = "/home/maxm/AE_training_data_all/datasets_4AE_extracted/russian_librispeech"
 
@@ -91,6 +93,9 @@ def _pin_single_thread():
                 kwargs["sess_options"] = opts
             opts.intra_op_num_threads = 1
             opts.inter_op_num_threads = 1
+            # Without this, ORT may still run independent graph branches on its
+            # inter-op pool; one thread per worker is the whole point here.
+            opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
             super().__init__(*args, **kwargs)
 
     ort.InferenceSession = _SingleThreaded
@@ -115,13 +120,22 @@ def _init_worker(device: str, workdir: str, accent_model: str, phon_model: str):
     _PHONEMIZER = RUPhon().load(phon_model, workdir=workdir, device=device)
 
 
+def _accent_one(text: str) -> str:
+    """Cyrillic -> '+'-accented Cyrillic with ё restored and every ё marked."""
+    return mark_yo_stress(_ACCENTOR.process_all(str(text).strip()))
+
+
+def _phonemize_accented(source: str, accented: str) -> str:
+    """Accented Cyrillic -> vocab-ready IPA, keyed on both forms for overrides."""
+    ipa = _PHONEMIZER.phonemize(accented, stress_symbol=IPA_STRESS)
+    return apply_word_overrides(source, remap_ruphon_ipa(ipa).strip(), accented)
+
+
 def _phonemize_one(text: str) -> str:
     """Cyrillic -> vocab-ready IPA. Returns '' on failure so the row can be dropped."""
     try:
         source = str(text).strip()
-        accented = mark_yo_stress(_ACCENTOR.process_all(source))
-        ipa = _PHONEMIZER.phonemize(accented, stress_symbol=IPA_STRESS)
-        return apply_word_overrides(source, remap_ruphon_ipa(ipa).strip())
+        return _phonemize_accented(source, _accent_one(source))
     except Exception:
         return ""
 
@@ -144,12 +158,27 @@ def _phonemize_texts(args) -> int:
     )
     results = []
     for text in args.text:
-        accented = mark_yo_stress(_ACCENTOR.process_all(str(text).strip()))
-        ipa = _phonemize_one(text)
+        # One accentuation pass, reused for the printout and the phonemization:
+        # running RUAccent twice doubled the latency of the interactive path and
+        # let the line labelled 'accented' drift from the one actually
+        # phonemized whenever the model was non-deterministic.
+        source = str(text).strip()
+        try:
+            accented = _accent_one(source)
+            ipa = _phonemize_accented(source, accented)
+        except Exception as exc:
+            print(f"[Russian G2P] FAILED: {text}: {exc}", file=sys.stderr)
+            return 1
         if not ipa:
             print(f"[Russian G2P] FAILED: {text}", file=sys.stderr)
             return 1
         print(f"{text}\n  accented: {accented}\n  ipa     : {ipa}")
+        # Anything outside the 256-token table silently becomes PAD at training
+        # and synthesis time, so surface it here where it is still debuggable.
+        oov = unknown_symbols(to_vocab_ipa(ipa))
+        if oov:
+            detail = " ".join(f"{c!r}(U+{ord(c):04X})" for c in oov)
+            print(f"  WARNING : symbols outside the vocab -> PAD: {detail}", file=sys.stderr)
         results.append(ipa)
     if args.out:
         import json

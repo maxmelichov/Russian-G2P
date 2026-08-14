@@ -53,6 +53,14 @@ _AFFRICATES: dict[str, str] = {
 _RUPHON_STRESS = "'"
 _IPA_STRESS = "ˈ"
 
+# RUPhon writes tie-bars as ASCII '~', but the same model emits real IPA tie
+# bars (U+0361 COMBINING DOUBLE INVERTED BREVE, U+035C below) depending on
+# version and on the stress_symbol argument. Fold both onto '~' first so the
+# table below sees one form. text_vocab's affricate pass only knows t͡s/t͡ʃ, so
+# the Russian-only t͡ɕ / t͡ʂ / d͡ʑ / d͡ʐ would otherwise survive into the vocab
+# as three separate tokens (t, U+0361, ɕ).
+_TIE_CHARS = re.compile("[͜͡]")
+
 # Any tie-bar this table does not name: keep both segments, drop the bar.
 _RESIDUAL_TIE = re.compile(r"(\S)~(\S)")
 
@@ -65,10 +73,14 @@ def remap_ruphon_ipa(text: str) -> str:
     ``text_vocab.normalize_text``, whose affricate pass does not recognise the
     tilde tie-bar form.
     """
+    text = _TIE_CHARS.sub("~", text)
     for src, dst in _AFFRICATES.items():
         text = text.replace(src, dst)
     text = _RESIDUAL_TIE.sub(r"\1\2", text)
     return text.replace(_RUPHON_STRESS, _IPA_STRESS)
+
+
+_WHITESPACE = re.compile(r"(\s+)")
 
 
 def mark_yo_stress(accented: str) -> str:
@@ -83,13 +95,27 @@ def mark_yo_stress(accented: str) -> str:
     (60.3%) produced no /ɵ/ at all. ё-restoration was unaffected -- RUAccent marks
     the stress on ё it inserts itself -- so this only touches already-written ё,
     which includes very common words (всё, ещё, её).
+
+    Three cases the naive ``replace("ё", "+ё", 1)`` got wrong:
+
+    * **Compounds with more than one ё.** трёхколёсный, четырёхзвёздочный and
+      трёхвёдерный carry PRIMARY stress on the LAST ё (-лё-, -звё-, -вё-); the
+      earlier one is secondary. Marking the first put primary stress on the wrong
+      syllable. There is no secondary-stress mark in RUPhon's '+' convention, so
+      the earlier ё is left bare -- one primary is right, two would be invalid.
+    * **Capital Ё.** Ёлка / Ёжик at sentence start contain no lowercase 'ё', so
+      the word was skipped entirely and RUPhon read it as /e/.
+    * **Newlines and tabs.** ``split(" ")`` treats "всё\\nещё" as one token, so
+      only the first ё of the pair was ever marked.
     """
-    out = []
-    for word in accented.split(" "):
-        if "ё" in word and "+" not in word:
-            word = word.replace("ё", "+ё", 1)
-        out.append(word)
-    return " ".join(out)
+    parts = _WHITESPACE.split(accented)
+    for i, word in enumerate(parts):
+        if "+" in word:
+            continue  # RUAccent already resolved this word's stress
+        idx = max(word.rfind("ё"), word.rfind("Ё"))
+        if idx >= 0:
+            parts[i] = word[:idx] + "+" + word[idx:]
+    return "".join(parts)
 
 
 # Words RUPhon mispronounces no matter how they are marked. всё renders /fsʲe/
@@ -105,21 +131,42 @@ _WORD_IPA_OVERRIDES: dict[str, str] = {
 }
 
 
-def apply_word_overrides(source: str, ipa: str) -> str:
+_STRIP_PUNCT = ".,!?;:\"'()«»—…-–[]{}"
+
+
+def _override_key(token: str) -> str:
+    """Orthographic lookup key: strip punctuation, RUAccent's '+', case-fold."""
+    return token.strip(_STRIP_PUNCT).replace("+", "").lower()
+
+
+def apply_word_overrides(source: str, ipa: str, accented: str | None = None) -> str:
     """Replace IPA tokens for source words in ``_WORD_IPA_OVERRIDES``.
 
     Token-aligned and fail-safe: if the word counts disagree, RUPhon did not emit
     one token per input word and the alignment cannot be trusted, so the IPA is
     returned untouched rather than corrupted.
+
+    ``accented`` is RUAccent's output for the same string, and is the form the
+    lookup should key on when it is available. Russian orthography routinely
+    writes ё as е -- that is the whole reason RUAccent's ё-restoration is in this
+    pipeline -- so a corpus row spelling всё as "все" never matched the override
+    table when only the raw source was consulted, which is precisely the case the
+    override exists to fix. The raw source stays as the fallback for when
+    RUAccent retokenized and the alignment cannot be trusted.
     """
     src_tokens = source.split()
     ipa_tokens = ipa.split()
     if len(src_tokens) != len(ipa_tokens):
         return ipa
+    acc_tokens = accented.split() if accented else []
+    if len(acc_tokens) != len(src_tokens):
+        acc_tokens = []
     changed = False
     for i, raw in enumerate(src_tokens):
-        key = raw.strip(".,!?;:\"'()«»—").lower()
+        key = _override_key(acc_tokens[i]) if acc_tokens else _override_key(raw)
         replacement = _WORD_IPA_OVERRIDES.get(key)
+        if replacement is None and acc_tokens:
+            replacement = _WORD_IPA_OVERRIDES.get(_override_key(raw))
         if replacement is None:
             continue
         # Carry over any trailing punctuation the phonemizer kept.
@@ -191,4 +238,4 @@ def phonemize_russian(
     source = str(text).strip()
     accented = mark_yo_stress(accentor.process_all(source))
     ipa = remap_ruphon_ipa(phonemizer.phonemize(accented)).strip()
-    return apply_word_overrides(source, ipa)
+    return apply_word_overrides(source, ipa, accented)

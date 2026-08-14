@@ -13,7 +13,10 @@ to learn a universal acoustic space via narrow IPA.
 """
 
 import re
+import sys
 from unicodedata import normalize as uni_normalize
+
+_TAG_PATTERN = re.compile(r"</?\w+>")
 
 # ============================================================
 # Piper phoneme map (exact IDs from rhasspy/piper-checkpoints)
@@ -72,15 +75,44 @@ VOCAB_LIST: list[str] = list(CHAR_TO_ID.keys())
 # Public API
 # ============================================================
 
-def text_to_indices(text: str, lang: str = "he") -> list[int]:
+def unknown_symbols(text: str) -> list[str]:
+    """Symbols in ``text`` that are not in the vocab, in order of appearance.
+
+    Every one of them becomes PAD (id 0) in ``text_to_indices``, which is
+    indistinguishable from padding downstream: raw Cyrillic handed to the model
+    by mistake maps to an all-PAD sequence and trains/synthesizes silence rather
+    than raising. Call this to check G2P output before it reaches the model.
+    """
+    text = _TAG_PATTERN.sub("", text)
+    seen: dict[str, None] = {}
+    for ch in text:
+        if ch not in CHAR_TO_ID:
+            seen.setdefault(ch, None)
+    return list(seen)
+
+
+def text_to_indices(text: str, lang: str = "he", on_oov: str = "pad") -> list[int]:
     """
     Convert an IPA phoneme string directly to vocab indices.
     No language tags are prepended. The lang argument is accepted
     to avoid breaking upstream callers but is silently ignored.
+
+    ``on_oov`` controls what happens to symbols outside the 256-token table:
+    "pad" (default, the historical behaviour) maps them to PAD_ID, "warn" does
+    the same but reports them once on stderr, "raise" refuses. Prefer "raise" in
+    offline G2P/preprocessing and "pad" on the training hot path.
     """
     # 1. Strip out ANY HTML-style tags (<he>, </en>, etc.)
-    text = re.sub(r"</?\w+>", "", text)
-    
+    text = _TAG_PATTERN.sub("", text)
+
+    if on_oov != "pad":
+        oov = unknown_symbols(text)
+        if oov:
+            detail = " ".join(f"{c!r}(U+{ord(c):04X})" for c in oov)
+            if on_oov == "raise":
+                raise ValueError(f"symbols outside the vocab: {detail}")
+            print(f"[Vocab] OOV -> PAD: {detail}", file=sys.stderr)
+
     return [CHAR_TO_ID.get(ch, PAD_ID) for ch in text]
 
 def text_to_indices_multilang(text: str, base_lang: str = "he") -> list[int]:
@@ -145,6 +177,12 @@ def normalize_text(text: str, apply_hebrew_fixes: bool = False) -> str:
 
     text = _normalize_affricate_ligatures(text)
 
+    # Undo the NFD pass for the one vocab symbol it decomposes. 'ç' is token 40,
+    # but NFD splits it into 'c' + U+0327 (tokens 16 + 140), so the same phoneme
+    # reached the model as one token or two depending on how the upstream G2P
+    # happened to encode it.
+    text = text.replace("c\u0327", "\u00e7")
+
     text = re.sub(r"\s+", " ", text).strip()
 
     # NOTE: the ']' used to sit right after the '\\', which closed the character
@@ -156,4 +194,10 @@ def normalize_text(text: str, apply_hebrew_fixes: bool = False) -> str:
 
     return text
 
-print(f"[Vocab] Universal IPA Active | VOCAB_SIZE={VOCAB_SIZE} | Max Used ID={max(CHAR_TO_ID.values())}")
+# Import-time banner on stderr, not stdout: importing this module must not
+# corrupt a pipeline that writes its payload to stdout, and it is imported once
+# per worker process, so 24 workers printed 24 copies of it into the log.
+print(
+    f"[Vocab] Universal IPA Active | VOCAB_SIZE={VOCAB_SIZE} | Max Used ID={max(CHAR_TO_ID.values())}",
+    file=sys.stderr,
+)
