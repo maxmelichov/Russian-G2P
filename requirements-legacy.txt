@@ -1,0 +1,5 @@
+# Legacy engine only (data/russian_g2p.py, scripts/phonemize_russian_legacy.py).
+# Pins transformers<5: install in its own environment.
+ruaccent
+ruphon
+transformers==4.44.2

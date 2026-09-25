@@ -3,7 +3,7 @@
 Deliberately model-free: everything here runs without ruaccent/ruphon (and
 without their ~1.5 GB of ONNX weights), so it can run in the training venv and
 in CI. The model-backed stages are covered by spot-checking real sentences with
-``scripts/phonemize_russian.py --text``.
+``scripts/phonemize_russian_legacy.py --text``.
 
     python -m pytest tests/ -q      # or: python tests/test_russian_g2p.py
 """

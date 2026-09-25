@@ -3,3 +3,6 @@ __pycache__/
 .venv/
 *.csv
 *.json
+
+# built by scripts/build_ru_lexicon.py (~375 MB of third-party data)
+/ru_lexicon/
