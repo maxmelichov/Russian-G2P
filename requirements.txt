@@ -1,3 +1,7 @@
-ruaccent
-ruphon
-transformers==4.44.2
+onnxruntime>=1.17
+tokenizers>=0.15
+numpy
+huggingface_hub   # scripts/build_ru_lexicon.py download only
+pytest
+# optional: Latin-script words via eSpeak en-us (needs the espeak-ng system package)
+# phonemizer

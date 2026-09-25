@@ -1,4 +1,9 @@
 """
+LEGACY ENGINE (RUAccent + RUPhon). Kept at this path because downstream code
+loads it by file path; the current engine is data/russian_phonemizer.py
+(dictionary stress + context models on onnxruntime + data/russian_g2p_rules.py).
+This one needs requirements-legacy.txt (transformers<5).
+
 Russian G2P: Cyrillic -> narrow IPA for TTS, in the 256-token Piper vocab.
 
 ARCHITECTURE: Two-Stage (accentuation -> phonemization -> vocab remap)
@@ -11,7 +16,7 @@ ARCHITECTURE: Two-Stage (accentuation -> phonemization -> vocab remap)
      symbols this project's vocab already uses.
 
 Stage 1+2 need the ruaccent/ruphon packages, which pin transformers<5 and are
-therefore kept OUT of the training environment: ``scripts/phonemize_russian.py``
+therefore kept OUT of the training environment: ``scripts/phonemize_russian_legacy.py``
 runs them once offline and writes an ``ipa`` column, exactly as the
 yiddish24-wav corpus ships a precomputed one. Only ``remap_ruphon_ipa`` -- which
 is pure string work -- is imported by the training/inference path.
@@ -206,7 +211,7 @@ def _load(device: str = "CPU", workdir: str | None = None):
                 "Russian raw-text G2P needs ruaccent and ruphon:\n"
                 "  pip install ruaccent ruphon 'transformers<5'\n"
                 "These pin transformers<5, so prefer running "
-                "scripts/phonemize_russian.py in a separate venv and consuming "
+                "scripts/phonemize_russian_legacy.py in a separate venv and consuming "
                 "its precomputed 'ipa' column."
             ) from exc
 

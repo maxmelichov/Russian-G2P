@@ -7,132 +7,171 @@ acoustic space (and one phoneme table) with Hebrew, Yiddish, English, German,
 Italian and Spanish. Everything here is the Russian half of that pipeline.
 
 ```
-Солнце уже село за старый замок.  →  sˈonʦɨ ʊʐˈɛ sʲˈeɫə za stˈarɨj zˈamək.
+Солнце уже село за старый замок.  →  sˈonʦə ʊʐˈɛ sʲˈeɫə za stˈarɨj zˈamək.
 Он повесил замок на дверь.        →  on pɐvʲˈesʲɪɫ zɐmˈok nˈa dvʲerʲ.
 ```
 
 Same word, two readings, resolved from context: за́мок (castle) vs замо́к (lock).
 
+It runs on `onnxruntime` + `tokenizers`. There is no `transformers` dependency
+and no neural phonemizer.
+
 ## How it works
 
-Three stages.
+Three stages, in `data/russian_phonemizer.py` and `data/russian_g2p_rules.py`.
 
-1. **RUAccent** (`turbo3.1`, dictionary on) places lexical stress and restores
-   ё that the orthography omits. Emits the `+`-before-stressed-vowel convention.
-2. **RUPhon** (`big`) turns `+`-accented Cyrillic into narrow IPA, applying the
-   stress-conditioned vowel reduction that makes Russian sound Russian —
-   `зам+ок → zɐmˈok` vs `з+амок → zˈamək`.
-3. **Remap** (`remap_ruphon_ipa`) folds RUPhon's tie-bar affricates and ASCII
-   stress mark onto the symbols the vocabulary already uses.
+1. **Stress and ё: a dictionary plus context models.** The lexicon comes from
+   RUAccent's 3.19 M-form, Zaliznyak-derived dictionary. Two cases need more
+   than a lookup. Words that exist both with and without ё (все/всё, сел/сёл)
+   go to RUAccent's ё-tagger. Stress homographs (за́мок/замо́к, де́ла/дела́,
+   го́ду/году́) go to RUAccent's `turbo3.1` homograph classifier. Both are ONNX
+   graphs with a `tokenizer.json`, run here directly with onnxruntime and
+   tokenizers. Before this stage, the text is normalized: numbers, years,
+   dates, decimals, `%` and currency become words, and dashes, quotes and
+   brackets are dropped.
+2. **Word → IPA: Moscow-norm rules.** These cover akanye/ikanye reduction
+   (`ɐ ə ɪ ɨ`), palatalization including assimilative `sʲtʲ zʲdʲ zʲnʲ`,
+   final devoicing and voicing assimilation, ё → `ɵ`, `ʉ` and `æ` between
+   soft consonants, `-ого/-его → və`, `-ться/-тся → ʦə` (`ʦːə` after the
+   stress), silent consonants (солнце, праздник, чувство), orthoepic `ʂn/ʂt`
+   (конечно, что), `сч/щ → ɕː`, and hard consonants in loanwords (кафе, тест,
+   компьютер). The target is Wiktionary's ru-pron standard, the transcription
+   RUPhon was trained to imitate. Each word is phonemized on its own; no
+   sandhi across word boundaries.
+3. **Vocab remap.** The output is written directly in the vocabulary's symbols:
+   `ʦ ʧ ʤ` ligatures, `ˈ` right before the stressed vowel (before the `j` of
+   an iotated vowel), `ɫ`, `Cː`. `data/text_vocab.normalize_text` is the last
+   step. Nothing comes out that maps to PAD; the tests enforce this.
 
-Stage 3 is pure string work with no model dependencies, so it is safe to import
-from a training or inference process. Stages 1–2 are not: `ruaccent` and
-`ruphon` pin `transformers<5`, which is why they are run offline in a throwaway
-environment and the result is consumed as a precomputed column.
+The rest of the text handling:
 
-### Why not espeak-ng
+- **Punctuation.** `. , ! ? : ;` are kept on the preceding word.
+- **Latin words.** Latin-script words are read with eSpeak `en-us` through
+  `phonemizer`, if it is installed.
+- **Out-of-dictionary words.** These are mostly names. They get a stress guess
+  from the dictionary's majority stress for the word ending, or from a corpus
+  lexicon if you built one with `--labels`.
+- **Which tier was used.** `last_report()` (or `--report`) shows which tier
+  placed the stress on every word.
 
-espeak's `ru` voice is context-invariant, so `на двери висит замок` and
-`на горе стоит замок` phonemize identically. It also cannot restore omitted ё
-(~34% of rows in the corpus this was built for need it, and ё is always
-stressed), and it writes ы as `/y/`, which collides with the German ü already
-in the shared vocabulary.
+```
+$ python scripts/phonemize_russian.py --report --text "Он повесил замок на дверь."
+  ipa: on pɐvʲˈesʲɪɫ zɐmˈok nˈa dvʲerʲ.
+    он         mono              on
+    повесил    dict              pɐvʲˈesʲɪɫ
+    замок      homograph-model   zɐmˈok
+    ...
+```
 
-### Why not nsu-ai/russian_g2p
-
-Different lineage, and not substitutable here:
-
-| | nsu-ai/russian_g2p | this |
-| --- | --- | --- |
-| output | custom labels, `['D0','I','A','L','O0','K']` | narrow IPA |
-| stress | `+` must already be in the input, or dictionary lookup | neural homograph model + dictionary |
-| homographs | caller supplies morph tags (`['ноги','NOUN Case=Gen\|...']`) | resolved from sentence context |
-| ё restoration | no | yes |
-
-The output format alone rules it out: nothing downstream of an IPA phoneme
-table accepts `D0`/`O0`.
-
-## Install
-
-The model stack pins an old `transformers`, so give it its own environment:
+## Install and build the lexicon
 
 ```bash
-uv venv /tmp/ruvenv --python 3.11
-uv pip install --python /tmp/ruvenv/bin/python -r requirements.txt
+uv venv .venv --python 3.11
+uv pip install --python .venv/bin/python -r requirements.txt   # + phonemizer for Latin words
+.venv/bin/python scripts/build_ru_lexicon.py                   # ~45 s, writes ru_lexicon/ (~375 MB, gitignored)
+.venv/bin/python -m pytest -q tests/
 ```
+
+`build_ru_lexicon.py` downloads RUAccent's dictionaries and its two context
+models from the `ruaccent/accentuator` Hub repo. It then writes plain
+`.tsv.gz` tables and copies the ONNX models. Options:
+
+- `--src DIR` reuses an installed `ruaccent` package directory instead of
+  downloading.
+- `--labels meta.csv` adds corpus priors from a CSV with `text,ipa` columns:
+  - a stress lexicon for names that are not in the dictionary;
+  - a fallback homograph order, used when the context models are missing.
+
+Set `RU_LEXICON_DIR` to keep the lexicon somewhere else.
 
 ## Use
 
-One sentence:
-
 ```bash
-/tmp/ruvenv/bin/python scripts/phonemize_russian.py \
-    --text "Солнце уже село за старый замок." --out ru.json
+python scripts/phonemize_russian.py --text "В 1945 году закончилась война, и 9 мая стал праздником."
+#  ipa: v tˈɨsʲɪʧə dʲɪvʲɪʦˈot sˈorək pʲˈatəm ɡɐdˈu zɐkˈonʲʧɪɫəsʲ vɐjnˈa, i dʲɪvʲˈatəjə mˈajə staɫ prˈazʲnʲɪkəm.
+python scripts/phonemize_russian.py --csv corpus.csv --column text --workers 8   # adds an ipa column
 ```
-
-```
-Солнце уже село за старый замок.
-  accented: С+олнце уж+е с+ело за ст+арый з+амок.
-  ipa     : sˈonʦɨ ʊʐˈɛ sʲˈeɫə za stˈarɨj zˈamək.
-```
-
-A whole corpus — reads `<root>/metadata.csv`, writes `<root>/metadata_ipa.csv`
-with an added `ipa` column:
-
-```bash
-/tmp/ruvenv/bin/python scripts/phonemize_russian.py --root /path/to/corpus --workers 24
-```
-
-Neither model exposes a batch API — `phonemize()` takes one string — so
-throughput comes from processes, not batching. Each worker loads its own copy
-of both models (~1.5 GB), so `--workers` is bounded by RAM, not cores.
-
-One non-obvious detail is documented at length in the source: onnxruntime sizes
-its thread pool from `SessionOptions.intra_op_num_threads` and **ignores**
-`OMP_NUM_THREADS` for the default CPU EP. RUAccent builds four sessions and
-RUPhon one, none passing SessionOptions, so 24 workers × 5 sessions × 32 threads
-produced a load average of ~580 on 32 cores and 5 rows/s — half the
-single-process rate. `_pin_single_thread()` patches the constructor, which is
-the only lever short of forking the packages. It must run before `ruaccent` and
-`ruphon` are imported, since they capture `InferenceSession` at import time.
-
-From Python, without the corpus driver:
 
 ```python
-from data.russian_g2p import phonemize_russian
+from data.russian_phonemizer import phonemize_russian
 phonemize_russian("Он повесил замок на дверь.")   # 'on pɐvʲˈesʲɪɫ zɐmˈok nˈa dvʲerʲ.'
 ```
+
+About 13 sentences/s per process. Each process holds the lexicon (~1.5 GB RAM).
+
+## Accuracy
+
+The gold set is `tests/gold.tsv`: 604 words and 67 sentences (three of them
+with digits). The reference IPA is en.wiktionary's standard ru-pron line; each
+row records its URL and the raw IPA. It is converted to this notation:
+
+- tie-bar affricates become ligatures;
+- `ˈ` moves from the syllable onset to the vowel;
+- optional segments `⁽ʲ⁾ (ː) (j)` expand to both variants;
+- dialect lines are dropped.
+
+In sentences, homograph stress is fixed by meaning.
+
+| system | words exact | stress (polysyllables) | sentences exact | sentence PER |
+| --- | --- | --- | --- | --- |
+| **this engine** | **604/604** | **464/464** | **67/67** | **0.00%** |
+| RUAccent + RUPhon (the legacy engine) | 565/604 | 461/464 | 44/67 | 3.4% |
+| eSpeak-ng `ru` | 24/604 | 299/464 | 0/67 | 45.8% |
+
+The gold set was also the development set. As a held-out check, I scraped 96
+random corpus words that were never used during development: this engine got
+96/96, the legacy engine 95/96.
+
+The legacy engine's errors are systematic:
+
+- **ɵ in unmarked monosyllables:** нет → nʲɵt, без → bʲɵs, тем → tʲɵm.
+- **Wrong homograph readings:** она → ˈonə (the river). It showed up in
+  ~5,000 of 50,275 corpus sentences.
+- **Orthoepic `ʂn` read as `ʧn`:** конечно → kɐnʲˈeʧnə.
+- **Final devoicing without `ɣ → x`:** бог → bok.
+- **Digits spelled letter by letter:** "1945" → `æf`.
+
+eSpeak does not reduce vowels and writes ы as `y`.
+
+## Known residuals
+
+- **Homographs.** They are only as good as RUAccent's context classifier. It
+  gets most right, but not all; долгу and свечи were missed in a 40-sentence
+  corpus sample, and the legacy engine misses them too.
+- **ё/е pairs.** The ё-tagger is accepted at probability ≥ 0.8. At argmax it
+  turned "и сел у окна" into сёл. далеко/недалеко are always the literary е
+  form.
+- **Loanwords with a hard consonant before е.** These come from a ~40-stem
+  list (`HARD_STEMS`, plus whole-word `EXCEPTIONS`). Unlisted loans get a
+  palatalized consonant.
+- **Unknown names.** Stress is guessed by suffix analogy, so an unseen name can
+  be stressed wrongly. `--labels` fixes the ones your corpus contains.
+- **Latin words.** They go through English eSpeak and are not adapted to
+  Russian. Without `phonemizer` they stay as Latin letters, which are valid
+  vocab tokens but are spelled out.
+- **Numbers.** Only years (before год/года/году…) and dates (before a month)
+  become ordinals. Other numbers are nominative cardinals and are not inflected
+  for case ("с 5 людьми" → пять).
+- **No cross-word sandhi.** "в часы" stays `v ʧɪsˈɨ`. This is deliberate: it
+  is the convention of the TTS labels this was built for.
 
 ## Layout
 
 | file | |
 | --- | --- |
-| `data/russian_g2p.py` | the three stages; `remap_ruphon_ipa` is the model-free part |
-| `data/text_vocab.py` | the 256-token IPA vocabulary the output has to land in |
-| `scripts/phonemize_russian.py` | corpus driver and `--text` one-shot mode |
-
-## Two corrections applied on top of the models
-
-Both are narrow and both are justified by measurement, not taste.
-
-**`mark_yo_stress`** — RUAccent only inserts `+` where stress is *ambiguous*, so
-it leaves ё alone when the orthography already writes it. RUPhon needs the mark
-to realise ё as `/ɵ/` and renders the bare letter as `/e/`. ё is always stressed
-in Russian, so marking it is unconditionally correct. Without this, 445 of the
-738 rows that spell ё out (60.3%) produced no `/ɵ/` at all.
-
-**`_WORD_IPA_OVERRIDES`** — всё renders `/fsʲe/` however it is written (всё,
-вс+ё, Вс+ё), and no respelling helps (фсё → `fsʲe`, всьо → `fsʲjɵ`). It cannot
-be patched at the IPA level either, because `/fsʲe/` is the *correct* reading of
-все ("all") and все/всё is precisely the ё distinction — so the substitution has
-to know which source word it came from. Scoped tight: всё* is 453 of the 472
-ё-tokens that phonemize wrong (96%); the rest occur 1–3 times each.
+| `data/russian_phonemizer.py` | text normalization, stress/ё (dictionary + ONNX context models), public `phonemize_russian` |
+| `data/russian_g2p_rules.py` | one stressed word → IPA, Moscow-norm rules and exception lists |
+| `data/text_vocab.py` | the 256-token IPA vocabulary the output has to land in (kept identical to the parent TTS repo) |
+| `scripts/build_ru_lexicon.py` | builds `ru_lexicon/` from RUAccent's Hub repo; standalone |
+| `scripts/phonemize_russian.py` | `--text` / `--csv` driver for the engine |
+| `tests/gold.tsv`, `tests/test_gold.py` | the gold set and its test |
+| `data/russian_g2p.py`, `scripts/phonemize_russian_legacy.py`, `tests/test_legacy_remap.py` | the legacy RUAccent + RUPhon engine (needs `requirements-legacy.txt`, transformers<5); kept because downstream code loads `data/russian_g2p.py` by path, and used as an optional out-of-dictionary fallback when importable |
 
 ## Vocabulary
 
 `data/text_vocab.py` is the single source of truth for text → ids: 256 tokens
 built on the Piper phoneme set, `PAD=0`, `BOS=1`, `EOS=2`. Unknown characters
-map silently to `PAD` — they do **not** raise — so validate coverage when adding
+map silently to `PAD`; they do **not** raise. Validate coverage when adding
 material:
 
 ```python
@@ -141,44 +180,13 @@ ipa = normalize_text(ipa, apply_hebrew_fixes=False)
 assert not {c for c in ipa if c not in CHAR_TO_ID}
 ```
 
-The full Russian inventory produced by this pipeline is covered, schwa included
-(`ə`=59, `ɐ`=50, `ɨ`=73, `ɫ`=75, `ʲ`=119, `ʦ`=155, `ɵ`=85).
-
-`remap_ruphon_ipa` must run **before** `normalize_text`, whose affricate pass
-does not recognise the tilde tie-bar form.
-
 ## Credits
 
-This repository is thin. Almost all of the linguistic work is done by other
-people's open source, and the two Den4ikAI libraries in particular are what
-make context-sensitive Russian G2P possible at all here.
-
-### Runtime dependencies
-
 | project | author | license | role |
 | --- | --- | --- | --- |
-| [RUAccent](https://github.com/Den4ikAI/ruaccent) | Den4ikAI | MIT | **Stage 1.** Stress placement, homograph resolution and ё restoration. Models on the Hub at [`ruaccent/accentuator`](https://huggingface.co/ruaccent/accentuator); this pipeline uses `turbo3.1` with the dictionary enabled. |
-| [RUPhon](https://github.com/Den4ikAI/ruphon) | Denis Petrov, Ivan Shivalov (© 2024) | Apache-2.0 | **Stage 2.** `+`-accented Cyrillic → narrow IPA with stress-conditioned vowel reduction. This pipeline uses the `big` model. |
-| [ONNX Runtime](https://github.com/microsoft/onnxruntime) | Microsoft | MIT | Executes both models. RUAccent builds four sessions and RUPhon one; the threading note above is about this runtime, not about the libraries. |
-| [transformers](https://github.com/huggingface/transformers) / [huggingface_hub](https://github.com/huggingface/huggingface_hub) | Hugging Face | Apache-2.0 | Tokenizers and model download. The `transformers<5` pin these libraries carry is the reason this runs in its own environment. |
-
-### Phoneme inventory
-
-| project | author | license | role |
-| --- | --- | --- | --- |
-| [Piper](https://github.com/rhasspy/piper) | rhasspy (Michael Hansen) | MIT | `data/text_vocab.py` is built on Piper's phoneme set — ids 0–156 are the Piper core, 157–244 are extensions added for the other languages in the parent system. |
-
-### Referenced, not used
-
-| project | role here |
-| --- | --- |
-| [espeak-ng](https://github.com/espeak-ng/espeak-ng) (GPL-3.0) | The obvious alternative front end, and the one this pipeline deliberately does *not* use for Russian — see "Why not espeak-ng" above. |
-| [nsu-ai/russian_g2p](https://github.com/nsu-ai/russian_g2p) | NSU's Russian G2P, compared against above. Different output format and a different approach to stress; not a dependency. |
-
-### Data
-
-The measurements quoted in this README — the 60.3% ё figure, the 96% всё
-figure, the 26 замок tokens — come from a Russian read-audiobook corpus of
-LibriVox recordings ("Russian LibriSpeech"), ~50k utterances. The numbers are
-reported so the corrections in `russian_g2p.py` can be checked rather than
-taken on trust; the audio itself is not redistributed here.
+| [RUAccent](https://github.com/Den4ikAI/ruaccent) | Den4ikAI | MIT | The stress dictionary, the ё dictionaries, and the two ONNX context models (homograph classifier `turbo3.1`, ё-homograph tagger), from [`ruaccent/accentuator`](https://huggingface.co/ruaccent/accentuator). |
+| [Wiktionary](https://en.wiktionary.org) ru-pron | Wiktionary contributors | CC BY-SA | The pronunciation standard the rules implement and the gold set is drawn from. |
+| [ONNX Runtime](https://github.com/microsoft/onnxruntime), [tokenizers](https://github.com/huggingface/tokenizers) | Microsoft, Hugging Face | MIT, Apache-2.0 | Run the context models. |
+| [Piper](https://github.com/rhasspy/piper) | rhasspy | MIT | `data/text_vocab.py` is built on Piper's phoneme set. |
+| [RUPhon](https://github.com/Den4ikAI/ruphon) | Denis Petrov, Ivan Shivalov | Apache-2.0 | Legacy engine only. |
+| [espeak-ng](https://github.com/espeak-ng/espeak-ng) via [phonemizer](https://github.com/bootphon/phonemizer) | | GPL-3.0 | Optional, for Latin-script words only. |
